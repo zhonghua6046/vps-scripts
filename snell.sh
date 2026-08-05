@@ -1,8 +1,5 @@
 #!/bin/bash
 
-# 脚本出现错误时自动退出
-set -e
-
 # --- 变量及函数定义 ---
 
 # 版本号定义 (用于下载链接，下次更新只需修改这里)
@@ -98,7 +95,7 @@ download_snell(){
         i386 | i686) ARCH_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-i386.zip";;
         aarch64) ARCH_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-aarch64.zip";;
         armv7l) ARCH_URL="https://dl.nssurge.com/snell/snell-server-${VERSION}-linux-armv7l.zip";;
-        *) echo -e "${Error} 不支持的服务器架构: $ARCH"; exit 1;;
+        *) echo -e "${Error} 不支持的服务器架构: $ARCH"; return 1;;
     esac
     
     echo -e "${Info} 检测到架构为 ${ARCH}，正在下载 Snell Server ${VERSION}..."
@@ -107,7 +104,7 @@ download_snell(){
     echo -e "${Info} 解压安装文件..."
     unzip -o snell-server.zip -d /usr/local/bin/
     chmod +x "$SNELL_BIN_FILE"
-    rm snell-server.zip
+    rm -f snell-server.zip
     echo -e "${Info} Snell Server 二进制文件部署完成。"
 }
 
@@ -115,7 +112,7 @@ download_snell(){
 install_snell(){
     if [ -f "$SNELL_BIN_FILE" ]; then
         echo -e "${Error} Snell Server似乎已经安装，请勿重复安装！"
-        exit 1
+        return 0
     fi
     
     check_package_manager
@@ -184,7 +181,7 @@ EOF
 update_snell(){
     if [ ! -f "$SNELL_BIN_FILE" ]; then
         echo -e "${Error} 未检测到 Snell Server 安装，无法升级。"
-        exit 1
+        return 0
     fi
 
     local OLD_VER=$(get_installed_version)
@@ -219,10 +216,10 @@ update_snell(){
 uninstall_snell(){
     if [ ! -f "$SNELL_BIN_FILE" ]; then
         echo -e "${Error} 未检测到 Snell Server 安装，无需卸载。"
-        exit 1
+        return 0
     fi
     read -p "您确定要卸载 Snell Server 吗? [y/N]: " UNINSTALL_CONFIRM
-    [[ ! "$UNINSTALL_CONFIRM" =~ ^[yY]$ ]] && echo -e "${Info} 用户取消了卸载操作。" && exit 0
+    [[ ! "$UNINSTALL_CONFIRM" =~ ^[yY]$ ]] && echo -e "${Info} 用户取消了卸载操作。" && return 0
     
     systemctl stop snell || true
     systemctl disable snell || true
@@ -236,7 +233,7 @@ uninstall_snell(){
 view_config_info(){
     if [ ! -f "$SNELL_CONFIG_FILE" ]; then
         echo -e "${Error} Snell 配置文件不存在，可能未安装。"
-        exit 1
+        return 0
     fi
     local SNELL_PORT=$(grep "listen" "$SNELL_CONFIG_FILE" | awk -F'[:=]' '{print $NF}' | tr -d ' ')
     local SNELL_PSK=$(grep "psk" "$SNELL_CONFIG_FILE" | awk -F'[=]' '{print $2}' | tr -d ' ')
@@ -276,7 +273,7 @@ view_config_info(){
 modify_config(){
     if [ ! -f "$SNELL_CONFIG_FILE" ]; then
         echo -e "${Error} Snell 配置文件不存在，无法修改。请先安装。"
-        exit 1
+        return 0
     fi
 
     local current_port=$(grep "listen" "$SNELL_CONFIG_FILE" | awk -F'[:=]' '{print $NF}' | tr -d ' ')
@@ -345,45 +342,49 @@ EOF
     fi
 }
 
-
-# --- 主菜单 ---
+# --- 主菜单循环 ---
 main_menu(){
-    clear
-    if [ -f "$SNELL_BIN_FILE" ]; then
-        LOCAL_VER=$(get_installed_version)
-    else
-        LOCAL_VER="未安装"
-    fi
+    while true; do
+        clear
+        if [ -f "$SNELL_BIN_FILE" ]; then
+            LOCAL_VER=$(get_installed_version)
+        else
+            LOCAL_VER="未安装"
+        fi
 
-    echo "================================================"
-    echo "        Snell Server 一键管理脚本"
-    echo "        脚本版本: ${VERSION}  |  当前安装: ${LOCAL_VER}"
-    echo "================================================"
-    echo ""
-    echo "  1. 安装 Snell Server"
-    echo "  2. 卸载 Snell Server"
-    echo "  3. 查看 Snell 配置"
-    echo "  4. 修改 Snell 配置"
-    echo "  5. 升级 Snell Server (升级到 ${VERSION})"
-    echo ""
-    echo "  0. 退出脚本"
-    echo ""
-    echo "================================================"
-    read -p "请输入您的选择 [0-5]: " user_choice
+        echo "================================================"
+        echo "        Snell Server 一键管理脚本"
+        echo "        脚本版本: ${VERSION}  |  当前安装: ${LOCAL_VER}"
+        echo "================================================"
+        echo ""
+        echo "  1. 安装 Snell Server"
+        echo "  2. 卸载 Snell Server"
+        echo "  3. 查看 Snell 配置"
+        echo "  4. 修改 Snell 配置"
+        echo "  5. 升级 Snell Server (升级到 ${VERSION})"
+        echo ""
+        echo "  0. 退出脚本"
+        echo ""
+        echo "================================================"
+        read -p "请输入您的选择 [0-5]: " user_choice
 
-    case $user_choice in
-        1) install_snell ;;
-        2) uninstall_snell ;;
-        3) view_config_info ;;
-        4) modify_config ;;
-        5) update_snell ;;
-        0) exit 0 ;;
-        *)
-            echo -e "${Error} 无效的输入，请输入正确的数字。"
-            sleep 2
-            main_menu
-            ;;
-    esac
+        case $user_choice in
+            1) install_snell ;;
+            2) uninstall_snell ;;
+            3) view_config_info ;;
+            4) modify_config ;;
+            5) update_snell ;;
+            0) exit 0 ;;
+            *)
+                echo -e "${Error} 无效的输入，请输入正确的数字。"
+                sleep 2
+                continue
+                ;;
+        esac
+
+        echo ""
+        read -n1 -r -p "按任意键返回主菜单..."
+    done
 }
 
 # --- 脚本执行入口 ---
