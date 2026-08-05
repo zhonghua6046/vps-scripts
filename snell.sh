@@ -46,11 +46,11 @@ check_package_manager(){
 
 # 安装依赖
 install_dependencies(){
-    echo -e "${Info} 正在安装必要工具 (wget, unzip)..."
+    echo -e "${Info} 正在安装必要工具 (wget, unzip, curl)..."
     if [ "$PM" = "apt" ]; then
-        apt-get update && apt-get install -y wget unzip
+        apt-get update && apt-get install -y wget unzip curl
     elif [ "$PM" = "yum" ] || [ "$PM" = "dnf" ]; then
-        $PM install -y wget unzip
+        $PM install -y wget unzip curl
     fi
     echo -e "${Info} 依赖安装完成。"
 }
@@ -65,12 +65,20 @@ generate_random_port(){
     echo $((RANDOM % 45536 + 20000))
 }
 
-# 获取实际安装的版本号 (修复点：从二进制文件读取)
+# 获取服务器公网 IP
+get_public_ip(){
+    local ip
+    ip=$(curl -s4 -m 5 https://api.ipify.org 2>/dev/null || curl -s4 -m 5 https://ip.sb 2>/dev/null || wget -qO- -t 1 -T 5 https://api.ipify.org 2>/dev/null || true)
+    if [ -z "$ip" ]; then
+        ip="您的服务器IP"
+    fi
+    echo "$ip"
+}
+
+# 获取实际安装的版本号
 get_installed_version(){
     if [ -f "$SNELL_BIN_FILE" ]; then
-        # 运行 snell-server -v，将错误流重定向到标准流，然后用 grep 提取 vX.X.X 格式
-        # 输出示例：2025-12-30 ... snell-server v5.0.0 ...
-        local ver_output=$($SNELL_BIN_FILE -v 2>&1 | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' | head -n 1)
+        local ver_output=$($SNELL_BIN_FILE -v 2>&1 | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+' | head -n 1 || true)
         if [ -z "$ver_output" ]; then
             echo "未知版本"
         else
@@ -116,6 +124,11 @@ install_snell(){
 
     # 配置Snell
     echo -e "${Info} 开始配置 Snell Server..."
+    read -p "请输入节点名称备注 [留空默认: Snell-Server]: " SNELL_REMARK
+    if [ -z "${SNELL_REMARK}" ]; then
+        SNELL_REMARK="Snell-Server"
+    fi
+
     read -p "请输入 Snell 服务端口 [留空则随机生成 20000-65535]: " SNELL_PORT
     if [ -z "${SNELL_PORT}" ]; then
         SNELL_PORT=$(generate_random_port)
@@ -133,6 +146,7 @@ install_snell(){
     mkdir -p "$SNELL_CONFIG_DIR"
     cat > "$SNELL_CONFIG_FILE" <<EOF
 [snell-server]
+# remark = ${SNELL_REMARK}
 listen = 0.0.0.0:${SNELL_PORT}
 psk = ${SNELL_PSK}
 ipv6 = ${SNELL_IPV6}
@@ -218,7 +232,7 @@ uninstall_snell(){
     echo -e "${Green_font_prefix}Snell Server 已成功卸载！${Font_color_suffix}"
 }
 
-# 查看配置信息 (已修改)
+# 查看配置信息与节点配置
 view_config_info(){
     if [ ! -f "$SNELL_CONFIG_FILE" ]; then
         echo -e "${Error} Snell 配置文件不存在，可能未安装。"
@@ -227,16 +241,29 @@ view_config_info(){
     local SNELL_PORT=$(grep "listen" "$SNELL_CONFIG_FILE" | awk -F'[:=]' '{print $NF}' | tr -d ' ')
     local SNELL_PSK=$(grep "psk" "$SNELL_CONFIG_FILE" | awk -F'[=]' '{print $2}' | tr -d ' ')
     local SNELL_IPV6=$(grep "ipv6" "$SNELL_CONFIG_FILE" | awk -F'[=]' '{print $2}' | tr -d ' ')
+    local SNELL_REMARK=$(grep -E "^# ?remark" "$SNELL_CONFIG_FILE" | awk -F'=' '{print $2}' | sed 's/^[ \t]*//;s/[ \t]*$//' || true)
     
-    # 这里调用检测函数，获取真实的二进制文件版本
+    [ -z "$SNELL_REMARK" ] && SNELL_REMARK="Snell-Server"
+    
     local CURRENT_VER=$(get_installed_version)
+    # 提取主版本号数字 (如 v5.0.1 提取出 5)
+    local SNELL_VER_NUM=$(echo "$CURRENT_VER" | grep -o 'v[0-9]\+' | tr -d 'v' || true)
+    [ -z "$SNELL_VER_NUM" ] && SNELL_VER_NUM="5"
+
+    local PUBLIC_IP=$(get_public_ip)
 
     echo -e "\n${Green_font_prefix}---------- Snell 配置信息 ----------${Font_color_suffix}"
-    echo -e "  - ${Green_font_prefix}端口 (Port):${Font_color_suffix}  ${SNELL_PORT}"
-    echo -e "  - ${Green_font_prefix}密钥 (PSK):${Font_color_suffix}   ${SNELL_PSK}"
-    echo -e "  - ${Green_font_prefix}IPv6 支持:${Font_color_suffix}    ${SNELL_IPV6}"
-    echo -e "  - ${Green_font_prefix}当前版本:${Font_color_suffix}     ${CURRENT_VER}"
-    echo -e "${Green_font_prefix}------------------------------------${Font_color_suffix}\n"
+    echo -e "  - ${Green_font_prefix}节点名称:${Font_color_suffix}  ${SNELL_REMARK}"
+    echo -e "  - ${Green_font_prefix}服务器IP:${Font_color_suffix}  ${PUBLIC_IP}"
+    echo -e "  - ${Green_font_prefix}服务端口:${Font_color_suffix}  ${SNELL_PORT}"
+    echo -e "  - ${Green_font_prefix}连接密钥:${Font_color_suffix}  ${SNELL_PSK}"
+    echo -e "  - ${Green_font_prefix}IPv6开关:${Font_color_suffix}  ${SNELL_IPV6}"
+    echo -e "  - ${Green_font_prefix}当前版本:${Font_color_suffix}  ${CURRENT_VER}"
+    echo -e "${Green_font_prefix}------------------------------------${Font_color_suffix}"
+
+    echo -e "\n${Green_font_prefix}---------- 链接分享/节点配置 ----------${Font_color_suffix}"
+    echo -e "${SNELL_REMARK} = snell, ${PUBLIC_IP}, ${SNELL_PORT}, psk=${SNELL_PSK}, version=${SNELL_VER_NUM}, reuse=true"
+    echo -e "${Green_font_prefix}--------------------------------------------${Font_color_suffix}\n"
     
     if systemctl is-active --quiet snell; then
         echo -e "${Info} Snell 服务正在 ${Green_font_prefix}运行中${Font_color_suffix}。"
@@ -255,8 +282,17 @@ modify_config(){
     local current_port=$(grep "listen" "$SNELL_CONFIG_FILE" | awk -F'[:=]' '{print $NF}' | tr -d ' ')
     local current_psk=$(grep "psk" "$SNELL_CONFIG_FILE" | awk -F'[=]' '{print $2}' | tr -d ' ')
     local current_ipv6=$(grep "ipv6" "$SNELL_CONFIG_FILE" | awk -F'[=]' '{print $2}' | tr -d ' ')
+    local current_remark=$(grep -E "^# ?remark" "$SNELL_CONFIG_FILE" | awk -F'=' '{print $2}' | sed 's/^[ \t]*//;s/[ \t]*$//' || true)
+    [ -z "$current_remark" ] && current_remark="Snell-Server"
 
     echo -e "${Info} 开始修改配置。"
+    read -p "请输入新的节点名称 [当前: ${current_remark}] (直接回车保留): " new_remark_input
+    if [ -z "${new_remark_input}" ]; then
+        new_remark="${current_remark}"
+    else
+        new_remark="${new_remark_input}"
+    fi
+
     read -p "请输入新的端口 [当前: ${current_port}] (直接回车保留, 输入 'rand' 随机生成): " new_port_input
     if [ -z "${new_port_input}" ]; then
         new_port="${current_port}"
@@ -291,6 +327,7 @@ modify_config(){
 
     cat > "$SNELL_CONFIG_FILE" <<EOF
 [snell-server]
+# remark = ${new_remark}
 listen = 0.0.0.0:${new_port}
 psk = ${new_psk}
 ipv6 = ${new_ipv6}
@@ -312,7 +349,6 @@ EOF
 # --- 主菜单 ---
 main_menu(){
     clear
-    # 获取一下当前版本用于显示
     if [ -f "$SNELL_BIN_FILE" ]; then
         LOCAL_VER=$(get_installed_version)
     else
