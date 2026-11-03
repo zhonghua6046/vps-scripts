@@ -29,7 +29,7 @@ install_dependencies() {
 # 2. 安装/更新 Xray
 install_xray() {
     echo -e "${GREEN}正在安装/更新 Xray...${PLAIN}"
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install -u root
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
     
     if [[ ! -f "$XRAY_BIN" ]]; then
         echo -e "${RED}错误：Xray 安装失败，未找到 $XRAY_BIN 文件。${PLAIN}"
