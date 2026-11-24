@@ -349,14 +349,14 @@ cat >> "$tmp_cfg" <<EOF
         {
             "tag": "IP4_out",
             "protocol": "freedom",
-            "settings": {
+            "streamSettings": {
                 "domainStrategy": "UseIPv4"
             }
         },
         {
             "tag": "IP6_out",
             "protocol": "freedom",
-            "settings": {
+            "streamSettings": {
                 "domainStrategy": "UseIPv6"
             }
         }
