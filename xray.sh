@@ -1273,7 +1273,8 @@ EOF
             },
             {
                 "domain": [
-                    "geosite:cn"
+                    "geosite:cn",
+                    "geoip:private"
                 ],
                 "outboundTag": "block"
             },
