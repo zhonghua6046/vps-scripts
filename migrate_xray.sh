@@ -395,7 +395,8 @@ cat >> "$tmp_cfg" <<EOF
             },
             {
                 "domain": [
-                    "geosite:cn"
+                    "geosite:cn",
+                    "geoip:private"
                 ],
                 "outboundTag": "block"
             },
