@@ -951,9 +951,9 @@ configure_xray() {
     cecho "1. 仅安装 Reality"
     cecho "2. 仅安装 Shadowsocks"
     cecho "3. 安装 Reality + Shadowsocks (共存)"
-    printf "请输入选项 [1-3] (默认 3): "
+    printf "请输入选项 [1-3] (默认 1): "
     read -r install_mode
-    [ -z "$install_mode" ] && install_mode="3"
+    [ -z "$install_mode" ] && install_mode="1"
     case "$install_mode" in
         1|2|3) ;;
         *)
