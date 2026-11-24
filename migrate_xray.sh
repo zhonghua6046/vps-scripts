@@ -218,12 +218,17 @@ fi
 cecho "\n${GREEN}提取到的现有参数如下（将 100% 保持不变）：${PLAIN}"
 if [ "$has_reality" = "true" ]; then
     reality_pbk=""
+    reality_hash32=""
     if [ -x "$XRAY_BIN" ]; then
-        reality_pbk=$("$XRAY_BIN" x25519 -i "$reality_private_key" 2>/dev/null | grep -Ei "^(Public|Password)" | cut -d: -f2 | tr -d ' \r\n')
+        x25519_out=$("$XRAY_BIN" x25519 -i "$reality_private_key" 2>/dev/null)
+        reality_pbk=$(printf '%s\n' "$x25519_out" | grep -Ei "^(Public|Password)" | head -n 1 | cut -d: -f2 | tr -d ' \r\n')
+        reality_hash32=$(printf '%s\n' "$x25519_out" | grep -Ei "^Hash32" | head -n 1 | cut -d: -f2 | tr -d ' \r\n')
     fi
     cecho "  [Reality] 外网端口=${reality_port} | 内网回落=${reality_inner_port} | 目标=${reality_dest_host}:${reality_dest_port} | SNI=${reality_sni}"
     cecho "            UUID=${reality_uuid} | ShortId=${reality_shortid}"
-    cecho "            PBK=${reality_pbk:-推导失败} (已提取 PrivateKey)"
+    cecho "            PrivateKey=${reality_private_key}"
+    cecho "            Password (PublicKey)=${reality_pbk:-推导失败}"
+    cecho "            Hash32=${reality_hash32:-未输出 (请检查内核版本)}"
 fi
 if [ "$has_ss" = "true" ]; then
     cecho "  [SS]      端口=${ss_port} | 加密=${ss_method} | 密码=${ss_password}"
