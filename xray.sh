@@ -1273,14 +1273,14 @@ EOF
             },
             {
                 "domain": [
-                    "geosite:cn",
-                    "geoip:private"
+                    "geosite:cn"
                 ],
                 "outboundTag": "block"
             },
             {
                 "ip": [
-                    "geoip:cn"
+                    "geoip:cn",
+                    "geoip:private"
                 ],
                 "outboundTag": "block"
             },
