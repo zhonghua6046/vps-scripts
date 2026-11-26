@@ -86,7 +86,7 @@ secure_config_permissions() {
     if grep -q '^xray:' /etc/group 2>/dev/null; then
         chown root:xray "$CONFIG_FILE"
         chmod 640 "$CONFIG_FILE"
-    elif [ "$INIT_SYS" = "openrc" ] \vert{}\vert{} grep -Eq '^User=root$' /etc/systemd/system/xray.service 2>/dev/null; then
+    elif [ "$INIT_SYS" = "openrc" ] || grep -Eq '^User=root$' /etc/systemd/system/xray.service 2>/dev/null; then
         chown root:root "$CONFIG_FILE"
         chmod 600 "$CONFIG_FILE"
     else
@@ -105,12 +105,12 @@ is_valid_port() {
 
 # 校验标准 UUID 格式
 is_valid_uuid() {
-    printf '%s' "$1" \vert{} grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    printf '%s' "$1" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 }
 
 # 校验 ShortId 格式 (2-16 位偶数长度十六进制字符)
 is_valid_shortid() {
-    printf '%s' "$1" \vert{} grep -Eq '^([0-9a-fA-F]{2}){1,8}$'
+    printf '%s' "$1" | grep -Eq '^([0-9a-fA-F]{2}){1,8}$'
 }
 
 # 检查本机端口是否已被占用
@@ -125,12 +125,21 @@ is_port_in_use() {
     fi
 }
 
-# 生成指定范围内未占用的随机端口 (支持排除 2 个指定端口)
+# 判断端口是否在空格分隔的排除列表中
+port_in_list() {
+    local target="$1"
+    local list="$2"
+    case " $list " in
+        *" $target "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 生成指定范围内未占用的随机端口 (第3参数支持空格分隔的多个排除端口)
 get_free_random_port() {
     local min="$1"
     local max="${2:-65535}"
-    local ex1="${3:-}"
-    local ex2="${4:-}"
+    local exclude_list="${3:-}"
     local tries=0
     local candidate=""
 
@@ -138,10 +147,10 @@ get_free_random_port() {
         if command -v shuf >/dev/null 2>&1; then
             candidate=$(shuf -i "${min}-${max}" -n 1)
         else
-            candidate=$(awk -v min="$min" -v max="$max" -v seed="$((tries +$$))" 'BEGIN{srand(seed); print int(min+rand()*(max-min+1))}')
+            candidate=$(awk -v min="$min" -v max="$max" -v seed="$((tries + $$))" 'BEGIN{srand(seed); print int(min+rand()*(max-min+1))}')
         fi
 
-        if [ "$candidate" != "$ex1" ] && [ "$candidate" != "$ex2" ] && ! is_port_in_use "$candidate"; then
+        if ! port_in_list "$candidate" "$exclude_list" && ! is_port_in_use "$candidate"; then
             printf '%s' "$candidate"
             return 0
         fi
@@ -299,6 +308,10 @@ render_qr() {
     local title="$1"
     local content="$2"
     if command -v qrencode >/dev/null 2>&1; then
+        if [ "${#content}" -gt 1200 ]; then
+            cecho "${YELLOW}提示：${title} 链接过长 (${#content} 字符，如 ML-KEM-768)，已跳过终端二维码渲染，请直接复制上方链接导入。${PLAIN}"
+            return 0
+        fi
         cecho "${CYAN}${title} (本地生成):${PLAIN}"
         qrencode -t ANSIUTF8 -m 2 "$content"
     else
@@ -316,14 +329,89 @@ generate_ss_password() {
     esac
 }
 
-# 保存节点元数据到本地 (权限 600，避免重复联网查询 IP)
+# 生成 VLESS Encryption 密钥对 (通过全局变量 VE_DECRYPTION / VE_ENCRYPTION 返回)
+generate_vless_enc_keys() {
+    local auth_choice="$1"
+    local vlessenc_out dec1 enc1 dec2 enc2 mlkem_seed mlkem_client
+    vlessenc_out=$("$XRAY_BIN" vlessenc 2>/dev/null)
+    if [ -z "$vlessenc_out" ]; then
+        cecho "${RED}错误：无法运行 xray vlessenc，请先更新 Xray 内核至 v25.9.5 或更高版本！${PLAIN}"
+        return 1
+    fi
+
+    dec1=$(printf '%s\n' "$vlessenc_out" | grep '"decryption":' | sed -n '1p' | cut -d'"' -f4)
+    enc1=$(printf '%s\n' "$vlessenc_out" | grep '"encryption":' | sed -n '1p' | cut -d'"' -f4)
+    dec2=$(printf '%s\n' "$vlessenc_out" | grep '"decryption":' | sed -n '2p' | cut -d'"' -f4)
+    enc2=$(printf '%s\n' "$vlessenc_out" | grep '"encryption":' | sed -n '2p' | cut -d'"' -f4)
+
+    if [ -z "$dec1" ] || [ -z "$enc1" ] || [ -z "$dec2" ] || [ -z "$enc2" ]; then
+        cecho "${RED}错误：解析 xray vlessenc 输出失败！${PLAIN}"
+        return 1
+    fi
+
+    case "$auth_choice" in
+        2)
+            VE_DECRYPTION="$dec2"
+            VE_ENCRYPTION="$enc2"
+            ;;
+        3)
+            mlkem_seed=$(printf '%s' "$dec2" | cut -d. -f4)
+            mlkem_client=$(printf '%s' "$enc2" | cut -d. -f4)
+            VE_DECRYPTION="${dec1}.${mlkem_seed}"
+            VE_ENCRYPTION="${enc1}.${mlkem_client}"
+            ;;
+        *)
+            VE_DECRYPTION="$dec1"
+            VE_ENCRYPTION="$enc1"
+            ;;
+    esac
+    return 0
+}
+
+# 从 X25519 类型的 decryption 反推客户端 encryption (用于未保存 node_info.env 时的回落)
+derive_vless_enc_client() {
+    local dec="$1"
+    local prefix mode key pub
+    prefix=$(printf '%s' "$dec" | cut -d. -f1)
+    mode=$(printf '%s' "$dec" | cut -d. -f2)
+    key=$(printf '%s' "$dec" | cut -d. -f4)
+    # 仅对标准 43/44 字符 X25519 私钥尝试推导
+    if [ "${#key}" -ge 40 ] && [ "${#key}" -le 50 ] && [ -x "$XRAY_BIN" ]; then
+        pub=$("$XRAY_BIN" x25519 -i "$key" 2>/dev/null | grep -Ei "^(Public|Password)" | head -n 1 | cut -d: -f2 | tr -d ' \r\n')
+        if [ -n "$pub" ]; then
+            printf '%s.%s.0rtt.%s' "$prefix" "$mode" "$pub"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 保存节点元数据到本地 (权限 600，保留未传入的字段)
 save_node_metadata() {
-    local node_name="$1"
-    local server_ip="$2"
+    local new_name="${1:-}"
+    local new_ip="${2:-}"
+    local new_ve_enc="${3:-__KEEP__}"
+
+    local old_name="" old_ip="" old_ve_enc=""
+    if [ -f "$INFO_FILE" ]; then
+        # shellcheck disable=SC1090
+        . "$INFO_FILE"
+        old_name="$NODE_NAME"
+        old_ip="$SERVER_IP"
+        old_ve_enc="$VLESS_ENC_CLIENT"
+    fi
+
+    [ -z "$new_name" ] && new_name="$old_name"
+    [ -z "$new_ip" ] && new_ip="$old_ip"
+    if [ "$new_ve_enc" = "__KEEP__" ]; then
+        new_ve_enc="$old_ve_enc"
+    fi
+
     mkdir -p "$(dirname "$INFO_FILE")"
     {
-        printf "NODE_NAME='%s'\n" "$(escape_sq "$node_name")"
-        printf "SERVER_IP='%s'\n" "$(escape_sq "$server_ip")"
+        printf "NODE_NAME='%s'\n" "$(escape_sq "$new_name")"
+        printf "SERVER_IP='%s'\n" "$(escape_sq "$new_ip")"
+        printf "VLESS_ENC_CLIENT='%s'\n" "$(escape_sq "$new_ve_enc")"
     } > "$INFO_FILE"
     chmod 600 "$INFO_FILE"
 }
@@ -378,13 +466,13 @@ show_node_info() {
         return 1
     fi
 
-    local custom_node_name=""
-    local server_ip=""
+    local custom_node_name="" server_ip="" saved_ve_client=""
     if [ -f "$INFO_FILE" ]; then
         # shellcheck disable=SC1090
         . "$INFO_FILE"
         custom_node_name="$NODE_NAME"
         server_ip="$SERVER_IP"
+        saved_ve_client="$VLESS_ENC_CLIENT"
     fi
 
     [ -z "$custom_node_name" ] && custom_node_name=$(uname -n)
@@ -405,19 +493,20 @@ show_node_info() {
     local default_outbound
     default_outbound=$(jq -r '.routing.rules[-1].outboundTag // "未知"' "$CONFIG_FILE")
 
-    local reality_json ss_json
+    local reality_json ss_json ve_json
     reality_json=$(jq -c '.inbounds[] | select(.protocol == "vless" and .streamSettings.security == "reality")' "$CONFIG_FILE" | head -n 1)
     ss_json=$(jq -c '.inbounds[] | select(.protocol == "shadowsocks")' "$CONFIG_FILE" | head -n 1)
+    ve_json=$(jq -c '.inbounds[] | select(.protocol == "vless" and (.settings.decryption // "none") != "none")' "$CONFIG_FILE" | head -n 1)
 
-    if [ -z "$reality_json" ] && [ -z "$ss_json" ]; then
-        cecho "${RED}当前配置文件中未检测到 Reality 或 Shadowsocks 节点。${PLAIN}"
+    if [ -z "$reality_json" ] && [ -z "$ss_json" ] && [ -z "$ve_json" ]; then
+        cecho "${RED}当前配置文件中未检测到 Reality、Shadowsocks 或 VLESS Encryption 节点。${PLAIN}"
         return 1
     fi
 
-    local has_both="false"
-    if [ -n "$reality_json" ] && [ -n "$ss_json" ]; then
-        has_both="true"
-    fi
+    local proto_count=0
+    [ -n "$reality_json" ] && proto_count=$((proto_count + 1))
+    [ -n "$ss_json" ] && proto_count=$((proto_count + 1))
+    [ -n "$ve_json" ] && proto_count=$((proto_count + 1))
 
     cecho ""
     cecho "${GREEN}================ 当前节点信息 ================${PLAIN}"
@@ -457,9 +546,7 @@ show_node_info() {
         fi
 
         local alias="$custom_node_name"
-        if [ "$has_both" = "true" ]; then
-            alias="${custom_node_name}-Reality"
-        fi
+        [ "$proto_count" -gt 1 ] && alias="${custom_node_name}-Reality"
         local encoded_alias reality_link
         encoded_alias=$(url_encode "$alias")
         reality_link="vless://${reality_uuid}@${link_ip}:${reality_port}?encryption=none&flow=${reality_flow}&security=reality&sni=${reality_sni}&fp=chrome&pbk=${reality_public_key}&sid=${reality_shortid}&type=tcp&headerType=none#${encoded_alias}"
@@ -488,9 +575,7 @@ show_node_info() {
         ss_password=$(printf '%s' "$ss_json" | jq -r '.settings.password // empty')
 
         ss_alias="$custom_node_name"
-        if [ "$has_both" = "true" ]; then
-            ss_alias="${custom_node_name}-SS"
-        fi
+        [ "$proto_count" -gt 1 ] && ss_alias="${custom_node_name}-SS"
         encoded_ss_alias=$(url_encode "$ss_alias")
         b64_user_pass=$(printf '%s:%s' "$ss_method" "$ss_password" | base64 | tr -d '\r\n')
         ss_link="ss://${b64_user_pass}@${link_ip}:${ss_port}#${encoded_ss_alias}"
@@ -504,6 +589,45 @@ show_node_info() {
         cecho "${ss_link}"
         cecho ""
         render_qr "Shadowsocks 二维码" "$ss_link"
+    fi
+
+    # 展示 VLESS Encryption 节点与本地二维码
+    if [ -n "$ve_json" ]; then
+        local ve_port ve_uuid ve_flow ve_dec ve_net ve_enc_client ve_alias encoded_ve_alias ve_link flow_param
+        ve_port=$(printf '%s' "$ve_json" | jq -r '.port // empty')
+        ve_uuid=$(printf '%s' "$ve_json" | jq -r '.settings.clients[0].id // empty')
+        ve_flow=$(printf '%s' "$ve_json" | jq -r '.settings.clients[0].flow // empty')
+        ve_dec=$(printf '%s' "$ve_json" | jq -r '.settings.decryption // empty')
+        ve_net=$(printf '%s' "$ve_json" | jq -r '.streamSettings.network // "raw"')
+
+        ve_enc_client="$saved_ve_client"
+        if [ -z "$ve_enc_client" ]; then
+            ve_enc_client=$(derive_vless_enc_client "$ve_dec" || true)
+        fi
+
+        ve_alias="$custom_node_name"
+        [ "$proto_count" -gt 1 ] && ve_alias="${custom_node_name}-VLESS-Enc"
+        encoded_ve_alias=$(url_encode "$ve_alias")
+
+        cecho "\n${YELLOW}--- [VLESS Encryption 节点] ---${PLAIN}"
+        cecho "节点备注: ${ve_alias}"
+        cecho "端口 (Port): ${ve_port}"
+        cecho "UUID: ${ve_uuid}"
+        cecho "流控 (Flow): ${ve_flow:-无}"
+        cecho "传输协议 (Network): ${ve_net}"
+        cecho "服务端 Decryption: ${ve_dec}"
+        if [ -n "$ve_enc_client" ]; then
+            cecho "客户端 Encryption: ${ve_enc_client}"
+            flow_param=""
+            [ -n "$ve_flow" ] && flow_param="&flow=${ve_flow}"
+            ve_link="vless://${ve_uuid}@${link_ip}:${ve_port}?encryption=$(url_encode "$ve_enc_client")${flow_param}&security=none&type=${ve_net}#${encoded_ve_alias}"
+            cecho "${GREEN}VLESS Encryption 分享链接 (本地生成):${PLAIN}"
+            cecho "${ve_link}"
+            cecho ""
+            render_qr "VLESS Encryption 二维码" "$ve_link"
+        else
+            cecho "${YELLOW}提示：未能从 node_info.env 读取客户端 Encryption（若为 ML-KEM-768 且经迁移而来，请手动对照原客户端 encryption 配置，或通过修改菜单重新生成密钥对）。${PLAIN}"
+        fi
     fi
 
     cecho "${GREEN}==============================================${PLAIN}"
@@ -537,7 +661,6 @@ edit_reality_in_tmp() {
 
     cecho "\n${YELLOW}--- 修改 Reality 节点 (直接回车保留当前值) ---${PLAIN}"
 
-    # 1. 外网端口
     printf "外网端口 [当前: %s]: " "$cur_port"
     read -r new_port
     [ -z "$new_port" ] && new_port="$cur_port"
@@ -546,7 +669,6 @@ edit_reality_in_tmp() {
         return 1
     fi
 
-    # 2. 内网回落端口 (仅新版防偷结构存在)
     local new_inner_port="$cur_inner_port"
     if [ -n "$dokodemo_json" ]; then
         printf "内网回落端口 [当前: %s] (回车不变，输入 auto 随机): " "$cur_inner_port"
@@ -566,7 +688,6 @@ edit_reality_in_tmp() {
         fi
     fi
 
-    # 3. 真实伪装目标
     printf "真实伪装目标 [当前: %s]: " "$cur_dest"
     read -r new_dest
     [ -z "$new_dest" ] && new_dest="$cur_dest"
@@ -585,16 +706,12 @@ edit_reality_in_tmp() {
         return 1
     fi
 
-    # 4. SNI
     local sni_default="$cur_sni"
-    if [ "$new_dest" != "$cur_dest" ]; then
-        sni_default="$new_dest_host"
-    fi
+    [ "$new_dest" != "$cur_dest" ] && sni_default="$new_dest_host"
     printf "SNI 域名 serverName [默认: %s]: " "$sni_default"
     read -r new_sni
     [ -z "$new_sni" ] && new_sni="$sni_default"
 
-    # 5. UUID (回车不变，auto 随机，或手动输入)
     local new_uuid="$cur_uuid"
     printf "UUID [当前: %s] (回车不变，输入 auto 随机): " "$cur_uuid"
     read -r uuid_input
@@ -608,7 +725,6 @@ edit_reality_in_tmp() {
         new_uuid="$uuid_input"
     fi
 
-    # 6. ShortId (回车不变，auto 随机，或手动输入)
     local new_sid="$cur_sid"
     printf "ShortId [当前: %s] (回车不变，输入 auto 随机): " "$cur_sid"
     read -r sid_input
@@ -622,7 +738,6 @@ edit_reality_in_tmp() {
         new_sid="$sid_input"
     fi
 
-    # 7. 可选重置 X25519 密钥对
     local new_pk="$cur_pk"
     printf "是否重新生成 X25519 密钥对? (y/n, 默认 n): "
     read -r regen_key
@@ -637,7 +752,6 @@ edit_reality_in_tmp() {
         cecho "${GREEN}已生成新的 X25519 密钥对。${PLAIN}"
     fi
 
-    # 使用 jq 局部更新 Reality + dokodemo-in + 联动 SNI 路由规则
     local next_cfg="${tmp_cfg}.next"
     if [ -n "$dokodemo_json" ]; then
         jq --argjson port "$new_port" \
@@ -702,7 +816,6 @@ edit_ss_in_tmp() {
 
     cecho "\n${YELLOW}--- 修改 Shadowsocks 节点 (直接回车保留当前值) ---${PLAIN}"
 
-    # 1. 端口
     printf "SS 端口 [当前: %s]: " "$cur_port"
     read -r new_port
     [ -z "$new_port" ] && new_port="$cur_port"
@@ -711,7 +824,6 @@ edit_ss_in_tmp() {
         return 1
     fi
 
-    # 2. 加密方式
     cecho "当前加密方式: ${CYAN}${cur_method}${PLAIN}"
     cecho "可选加密方式 (直接回车保持不变):"
     cecho "1. 2022-blake3-aes-128-gcm"
@@ -740,7 +852,6 @@ edit_ss_in_tmp() {
             ;;
     esac
 
-    # 3. 密码
     local new_pass="$cur_pass"
     if [ "$new_method" != "$cur_method" ]; then
         cecho "${YELLOW}提示：加密方式已变更，留空将自动生成匹配 ${new_method} 的新密码。${PLAIN}"
@@ -761,7 +872,6 @@ edit_ss_in_tmp() {
         fi
     fi
 
-    # 使用 jq 局部更新 SS 入站
     local next_cfg="${tmp_cfg}.next"
     jq --argjson port "$new_port" \
        --arg method "$new_method" \
@@ -770,6 +880,89 @@ edit_ss_in_tmp() {
             .port = $port |
             .settings.method = $method |
             .settings.password = $pass
+        )' \
+        "$tmp_cfg" > "$next_cfg" || { rm -f "$next_cfg"; return 1; }
+
+    mv "$next_cfg" "$tmp_cfg"
+    return 0
+}
+
+# 在临时配置副本中局部修改 VLESS Encryption 节点
+edit_vless_enc_in_tmp() {
+    local tmp_cfg="$1"
+    local ve_json
+    ve_json=$(jq -c '.inbounds[] | select(.protocol == "vless" and (.settings.decryption // "none") != "none")' "$tmp_cfg" | head -n 1)
+    if [ -z "$ve_json" ]; then
+        cecho "${RED}错误：当前配置中未找到 VLESS Encryption 节点。${PLAIN}"
+        return 1
+    fi
+
+    local cur_port cur_uuid cur_flow cur_dec
+    cur_port=$(printf '%s' "$ve_json" | jq -r '.port')
+    cur_uuid=$(printf '%s' "$ve_json" | jq -r '.settings.clients[0].id')
+    cur_flow=$(printf '%s' "$ve_json" | jq -r '.settings.clients[0].flow // ""')
+    cur_dec=$(printf '%s' "$ve_json" | jq -r '.settings.decryption')
+
+    cecho "\n${YELLOW}--- 修改 VLESS Encryption 节点 (直接回车保留当前值) ---${PLAIN}"
+
+    printf "端口 [当前: %s]: " "$cur_port"
+    read -r new_port
+    [ -z "$new_port" ] && new_port="$cur_port"
+    if ! is_valid_port "$new_port"; then
+        cecho "${RED}错误：端口号 (${new_port}) 无效，必须为 1-65535。${PLAIN}"
+        return 1
+    fi
+
+    local new_uuid="$cur_uuid"
+    printf "UUID [当前: %s] (回车不变，输入 auto 随机): " "$cur_uuid"
+    read -r uuid_input
+    if [ "$uuid_input" = "auto" ]; then
+        new_uuid=$("$XRAY_BIN" uuid)
+    elif [ -n "$uuid_input" ]; then
+        if ! is_valid_uuid "$uuid_input"; then
+            cecho "${RED}错误：UUID 格式无效！${PLAIN}"
+            return 1
+        fi
+        new_uuid="$uuid_input"
+    fi
+
+    printf "流控 Flow [当前: %s] (回车不变，输入 none 清空，或手动输入如 xtls-rprx-vision): " "${cur_flow:-无}"
+    read -r flow_input
+    local new_flow="$cur_flow"
+    if [ "$flow_input" = "none" ]; then
+        new_flow=""
+    elif [ -n "$flow_input" ]; then
+        new_flow="$flow_input"
+    fi
+
+    local new_dec="$cur_dec"
+    NEW_VE_CLIENT_ENC="__KEEP__"
+    printf "是否重新生成 VLESS Encryption 密钥对? (y/n, 默认 n): "
+    read -r regen_ve
+    if [ "$regen_ve" = "y" ] || [ "$regen_ve" = "Y" ]; then
+        cecho "请选择认证方式:"
+        cecho "1. X25519 (默认推荐，链接极短、支持二维码)"
+        cecho "2. ML-KEM-768 (全链路后量子，字符串极长)"
+        cecho "3. X25519 + ML-KEM-768 同时启用 (优点: 双重兜底防单一算法失效；缺点: 链接最长/无二维码/握手略重)"
+        printf "请选择 [1-3] (默认 1): "
+        read -r auth_choice
+        [ -z "$auth_choice" ] && auth_choice="1"
+        generate_vless_enc_keys "$auth_choice" || return 1
+        new_dec="$VE_DECRYPTION"
+        NEW_VE_CLIENT_ENC="$VE_ENCRYPTION"
+        cecho "${GREEN}已生成新的 VLESS Encryption 密钥对。${PLAIN}"
+    fi
+
+    local next_cfg="${tmp_cfg}.next"
+    jq --argjson port "$new_port" \
+       --arg uuid "$new_uuid" \
+       --arg flow "$new_flow" \
+       --arg dec "$new_dec" \
+       '(.inbounds[] | select(.protocol == "vless" and (.settings.decryption // "none") != "none")) |= (
+            .port = $port |
+            .settings.decryption = $dec |
+            .settings.clients[0].id = $uuid |
+            if $flow != "" then .settings.clients[0].flow = $flow else del(.settings.clients[0].flow) end
         )' \
         "$tmp_cfg" > "$next_cfg" || { rm -f "$next_cfg"; return 1; }
 
@@ -817,7 +1010,6 @@ edit_common_settings() {
 
     if [ "$new_out" != "$cur_out" ]; then
         local next_cfg="${tmp_cfg}.next"
-        # 仅更新非 dokodemo-in 且非 block 的路由出口，避免误改回落转发规则
         jq --arg out "$new_out" \
            '(.routing.rules[] | select(((.inboundTag // []) | any(. == "dokodemo-in") | not) and .outboundTag != "block") | .outboundTag) = $out' \
            "$tmp_cfg" > "$next_cfg" || { rm -f "$next_cfg"; return 1; }
@@ -825,11 +1017,22 @@ edit_common_settings() {
         return 0
     fi
 
-    # 仅改了备注名，无需重启 Xray
     return 2
 }
 
-# 修改节点信息入口菜单 (区分 Reality / SS / 同时修改 / 公共设置)
+# 检查临时配置中所有入站端口是否互相冲突
+check_all_port_conflicts() {
+    local cfg="$1"
+    local dup_port
+    dup_port=$(jq -r '.inbounds[].port' "$cfg" | sort | uniq -d | head -n 1)
+    if [ -n "$dup_port" ]; then
+        cecho "${RED}错误：检测到入站端口冲突 (${dup_port})，已放弃修改！${PLAIN}"
+        return 1
+    fi
+    return 0
+}
+
+# 修改节点信息入口菜单
 modify_node_info() {
     if [ ! -f "$CONFIG_FILE" ]; then
         cecho "${RED}未找到配置文件 ($CONFIG_FILE)，请先执行选项 1 安装配置。${PLAIN}"
@@ -841,37 +1044,38 @@ modify_node_info() {
         install_dependencies
     fi
 
-    local has_reality="false"
-    local has_ss="false"
+    local has_reality="false" has_ss="false" has_ve="false"
     [ -n "$(jq -c '.inbounds[] | select(.protocol == "vless" and .streamSettings.security == "reality")' "$CONFIG_FILE" | head -n 1)" ] && has_reality="true"
     [ -n "$(jq -c '.inbounds[] | select(.protocol == "shadowsocks")' "$CONFIG_FILE" | head -n 1)" ] && has_ss="true"
+    [ -n "$(jq -c '.inbounds[] | select(.protocol == "vless" and (.settings.decryption // "none") != "none")' "$CONFIG_FILE" | head -n 1)" ] && has_ve="true"
 
-    if [ "$has_reality" = "false" ] && [ "$has_ss" = "false" ]; then
-        cecho "${RED}当前配置文件中未检测到可修改的 Reality 或 Shadowsocks 节点。${PLAIN}"
+    if [ "$has_reality" = "false" ] && [ "$has_ss" = "false" ] && [ "$has_ve" = "false" ]; then
+        cecho "${RED}当前配置文件中未检测到可修改的节点。${PLAIN}"
         return 1
     fi
 
     cecho ""
     cecho "${GREEN}--- 修改已配置的节点信息 ---${PLAIN}"
-    cecho "当前已配置协议: Reality=${CYAN}${has_reality}${PLAIN} | Shadowsocks=${CYAN}${has_ss}${PLAIN}"
-    cecho "1. 仅修改 Reality 节点"
-    cecho "2. 仅修改 Shadowsocks 节点"
-    cecho "3. 同时修改 Reality 和 Shadowsocks 节点"
+    cecho "当前已装协议: Reality=${CYAN}${has_reality}${PLAIN} | SS=${CYAN}${has_ss}${PLAIN} | VLESS-Enc=${CYAN}${has_ve}${PLAIN}"
+    cecho "1. 修改 Reality 节点"
+    cecho "2. 修改 Shadowsocks 节点"
+    cecho "3. 修改 VLESS Encryption 节点"
     cecho "4. 修改默认出口策略 (IPv4/IPv6/自动适配) 或节点备注名"
     cecho "0. 返回主菜单"
     printf "请选择 [0-4]: "
     read -r mod_choice
 
-    [ "$mod_choice" = "0" ] && return 0
+    [ "$mod_choice" = "0" ] && return 2
 
     local tmp_cfg
     tmp_cfg=$(mktemp)
     cp "$CONFIG_FILE" "$tmp_cfg"
+    NEW_VE_CLIENT_ENC="__KEEP__"
 
     case "$mod_choice" in
         1)
             if [ "$has_reality" = "false" ]; then
-                cecho "${RED}当前未配置 Reality 节点，如需新增请使用主菜单选项 1。${PLAIN}"
+                cecho "${RED}当前未配置 Reality 节点，请使用主菜单选项 2 加装。${PLAIN}"
                 rm -f "$tmp_cfg"
                 return 1
             fi
@@ -879,20 +1083,19 @@ modify_node_info() {
             ;;
         2)
             if [ "$has_ss" = "false" ]; then
-                cecho "${RED}当前未配置 Shadowsocks 节点，如需新增请使用主菜单选项 1。${PLAIN}"
+                cecho "${RED}当前未配置 Shadowsocks 节点，请使用主菜单选项 2 加装。${PLAIN}"
                 rm -f "$tmp_cfg"
                 return 1
             fi
             edit_ss_in_tmp "$tmp_cfg" || { rm -f "$tmp_cfg"; return 1; }
             ;;
         3)
-            if [ "$has_reality" = "false" ] || [ "$has_ss" = "false" ]; then
-                cecho "${RED}当前未同时配置 Reality 和 Shadowsocks，无法选择同时修改。${PLAIN}"
+            if [ "$has_ve" = "false" ]; then
+                cecho "${RED}当前未配置 VLESS Encryption 节点，请使用主菜单选项 2 加装。${PLAIN}"
                 rm -f "$tmp_cfg"
                 return 1
             fi
-            edit_reality_in_tmp "$tmp_cfg" || { rm -f "$tmp_cfg"; return 1; }
-            edit_ss_in_tmp "$tmp_cfg" || { rm -f "$tmp_cfg"; return 1; }
+            edit_vless_enc_in_tmp "$tmp_cfg" || { rm -f "$tmp_cfg"; return 1; }
             ;;
         4)
             edit_common_settings "$tmp_cfg"
@@ -914,32 +1117,362 @@ modify_node_info() {
             ;;
     esac
 
-    # 检查最终 Reality 外网端口、内网回落端口与 SS 端口是否冲突
-    local final_r_port final_i_port final_s_port
-    final_r_port=$(jq -r '(.inbounds[] | select(.protocol == "vless" and .streamSettings.security == "reality") | .port) // empty' "$tmp_cfg" | head -n 1)
-    final_i_port=$(jq -r '(.inbounds[] | select(.protocol == "dokodemo-door" and .settings.address != "127.0.0.1") | .port) // empty' "$tmp_cfg" | head -n 1)
-    final_s_port=$(jq -r '(.inbounds[] | select(.protocol == "shadowsocks") | .port) // empty' "$tmp_cfg" | head -n 1)
+    check_all_port_conflicts "$tmp_cfg" || { rm -f "$tmp_cfg"; return 1; }
 
-    if [ -n "$final_r_port" ] && [ -n "$final_s_port" ] && [ "$final_r_port" = "$final_s_port" ]; then
-        cecho "${RED}错误：Reality 外网端口与 Shadowsocks 端口 (${final_r_port}) 冲突，已放弃修改！${PLAIN}"
-        rm -f "$tmp_cfg"
-        return 1
-    fi
-    if [ -n "$final_i_port" ] && [ -n "$final_s_port" ] && [ "$final_i_port" = "$final_s_port" ]; then
-        cecho "${RED}错误：Reality 内网回落端口与 Shadowsocks 端口 (${final_i_port}) 冲突，已放弃修改！${PLAIN}"
-        rm -f "$tmp_cfg"
-        return 1
-    fi
-    if [ -n "$final_r_port" ] && [ -n "$final_i_port" ] && [ "$final_r_port" = "$final_i_port" ]; then
-        cecho "${RED}错误：Reality 外网端口与内网回落端口 (${final_r_port}) 冲突，已放弃修改！${PLAIN}"
-        rm -f "$tmp_cfg"
-        return 1
-    fi
-
-    # 校验、替换并重启 Xray，随后展示最新节点信息与二维码
     if apply_and_restart_config "$tmp_cfg"; then
+        [ "$NEW_VE_CLIENT_ENC" != "__KEEP__" ] && save_node_metadata "" "" "$NEW_VE_CLIENT_ENC"
         show_node_info
     fi
+}
+
+# === 交互式参数收集模块 (供全新安装与加装协议复用) ===
+
+collect_reality_params() {
+    local exclude_ports="$1"
+    cecho "${YELLOW}--- 配置 Reality (新版防偷流量架构) ---${PLAIN}"
+
+    printf "请输入 Reality 外网端口 (默认随机 40000-65535): "
+    read -r reality_port
+    if [ -z "$reality_port" ]; then
+        reality_port=$(get_free_random_port 40000 65535 "$exclude_ports")
+    else
+        if ! is_valid_port "$reality_port"; then
+            cecho "${RED}错误：Reality 外网端口 (${reality_port}) 无效！${PLAIN}"
+            return 1
+        fi
+        if port_in_list "$reality_port" "$exclude_ports"; then
+            cecho "${RED}错误：端口 (${reality_port}) 与现有节点端口冲突！${PLAIN}"
+            return 1
+        fi
+    fi
+
+    printf "请输入 Reality 内网回落端口 (仅监听 127.0.0.1，默认随机 20000-39999): "
+    read -r reality_inner_port
+    if [ -z "$reality_inner_port" ]; then
+        reality_inner_port=$(get_free_random_port 20000 39999 "$exclude_ports $reality_port")
+    else
+        if ! is_valid_port "$reality_inner_port"; then
+            cecho "${RED}错误：Reality 内网回落端口 (${reality_inner_port}) 无效！${PLAIN}"
+            return 1
+        fi
+        if port_in_list "$reality_inner_port" "$exclude_ports $reality_port"; then
+            cecho "${RED}错误：内网回落端口 (${reality_inner_port}) 与已有端口冲突！${PLAIN}"
+            return 1
+        fi
+    fi
+
+    printf "请输入真实伪装目标 (如 www.tesla.com:443，默认 www.tesla.com:443): "
+    read -r reality_dest
+    [ -z "$reality_dest" ] && reality_dest="www.tesla.com:443"
+    case "$reality_dest" in
+        *:*)
+            reality_dest_host=$(printf '%s' "$reality_dest" | cut -d: -f1)
+            reality_dest_port=$(printf '%s' "$reality_dest" | cut -d: -f2)
+            ;;
+        *)
+            reality_dest_host="$reality_dest"
+            reality_dest_port="443"
+            ;;
+    esac
+
+    if ! is_valid_port "$reality_dest_port"; then
+        cecho "${RED}错误：伪装目标端口 (${reality_dest_port}) 必须为 1-65535 之间的数字！${PLAIN}"
+        return 1
+    fi
+
+    printf "请输入 SNI 域名 serverName (默认 %s): " "$reality_dest_host"
+    read -r reality_sni
+    [ -z "$reality_sni" ] && reality_sni="$reality_dest_host"
+
+    printf "请输入 UUID (留空自动随机生成): "
+    read -r reality_uuid
+    if [ -z "$reality_uuid" ]; then
+        reality_uuid=$("$XRAY_BIN" uuid)
+    elif ! is_valid_uuid "$reality_uuid"; then
+        cecho "${RED}错误：输入的 UUID 格式无效！${PLAIN}"
+        return 1
+    fi
+
+    printf "请输入 ShortId (2-16位偶数十六进制字符，留空自动随机生成): "
+    read -r reality_shortid
+    if [ -z "$reality_shortid" ]; then
+        reality_shortid=$(openssl rand -hex 8)
+    elif ! is_valid_shortid "$reality_shortid"; then
+        cecho "${RED}错误：ShortId 必须为 2-16 位偶数长度的十六进制字符 (0-9, a-f)！${PLAIN}"
+        return 1
+    fi
+
+    cecho "${GREEN}正在生成 X25519 密钥...${PLAIN}"
+    x25519_out=$("$XRAY_BIN" x25519)
+    if [ -z "$x25519_out" ]; then
+        cecho "${RED}错误：无法运行 Xray 生成密钥！${PLAIN}"
+        return 1
+    fi
+
+    reality_private_key=$(printf '%s\n' "$x25519_out" | grep -i "^Private" | cut -d: -f2 | tr -d ' \r\n')
+    reality_public_key=$(printf '%s\n' "$x25519_out" | grep -Ei "^(Public|Password)" | cut -d: -f2 | tr -d ' \r\n')
+
+    if [ -z "$reality_private_key" ] || [ -z "$reality_public_key" ] || [ -z "$reality_uuid" ]; then
+        cecho "${RED}错误：获取密钥或 UUID 失败。${PLAIN}"
+        return 1
+    fi
+    return 0
+}
+
+collect_ss_params() {
+    local exclude_ports="$1"
+    cecho "${YELLOW}--- 配置 Shadowsocks ---${PLAIN}"
+
+    printf "请输入 SS 端口 (默认随机 40000-65535): "
+    read -r ss_port
+    if [ -z "$ss_port" ]; then
+        ss_port=$(get_free_random_port 40000 65535 "$exclude_ports")
+    else
+        if ! is_valid_port "$ss_port"; then
+            cecho "${RED}错误：SS 端口 (${ss_port}) 无效！${PLAIN}"
+            return 1
+        fi
+        if port_in_list "$ss_port" "$exclude_ports"; then
+            cecho "${RED}错误：SS 端口 (${ss_port}) 与已有端口冲突！${PLAIN}"
+            return 1
+        fi
+    fi
+
+    cecho "请选择加密方式:"
+    cecho "--- 2022 新版协议 (性能好，但对时间敏感) ---"
+    cecho "1. 2022-blake3-aes-128-gcm"
+    cecho "2. 2022-blake3-aes-256-gcm (推荐)"
+    cecho "3. 2022-blake3-chacha20-poly1305"
+    cecho "--- 经典通用协议 (兼容性最好) ---"
+    cecho "4. aes-128-gcm"
+    cecho "5. aes-256-gcm (常用)"
+    cecho "6. chacha20-poly1305 (移动端推荐)"
+    cecho "7. xchacha20-poly1305"
+
+    printf "请选择 [1-7] (默认 2): "
+    read -r ss_method_choice
+    case "$ss_method_choice" in
+        1) ss_method="2022-blake3-aes-128-gcm" ;;
+        2) ss_method="2022-blake3-aes-256-gcm" ;;
+        3) ss_method="2022-blake3-chacha20-poly1305" ;;
+        4) ss_method="aes-128-gcm" ;;
+        5) ss_method="aes-256-gcm" ;;
+        6) ss_method="chacha20-poly1305" ;;
+        7) ss_method="xchacha20-poly1305" ;;
+        *) ss_method="2022-blake3-aes-256-gcm" ;;
+    esac
+
+    printf "请输入 SS 密码 (留空自动生成): "
+    read -r ss_password
+    if [ -z "$ss_password" ]; then
+        ss_password=$(generate_ss_password "$ss_method")
+    fi
+    return 0
+}
+
+collect_vless_enc_params() {
+    local exclude_ports="$1"
+    cecho "${YELLOW}--- 配置 VLESS Encryption (原生后量子加密) ---${PLAIN}"
+
+    printf "请输入 VLESS Encryption 端口 (默认随机 40000-65535): "
+    read -r ve_port
+    if [ -z "$ve_port" ]; then
+        ve_port=$(get_free_random_port 40000 65535 "$exclude_ports")
+    else
+        if ! is_valid_port "$ve_port"; then
+            cecho "${RED}错误：VLESS Encryption 端口 (${ve_port}) 无效！${PLAIN}"
+            return 1
+        fi
+        if port_in_list "$ve_port" "$exclude_ports"; then
+            cecho "${RED}错误：端口 (${ve_port}) 与已有端口冲突！${PLAIN}"
+            return 1
+        fi
+    fi
+
+    printf "请输入 UUID (留空自动随机生成): "
+    read -r ve_uuid
+    if [ -z "$ve_uuid" ]; then
+        ve_uuid=$("$XRAY_BIN" uuid)
+    elif ! is_valid_uuid "$ve_uuid"; then
+        cecho "${RED}错误：输入的 UUID 格式无效！${PLAIN}"
+        return 1
+    fi
+
+    printf "请输入流控 Flow (默认留空无流控，如需开启请手动输入如 xtls-rprx-vision): "
+    read -r ve_flow
+
+    cecho "请选择身份认证方式 (流量加密均为后量子安全):"
+    cecho "1. X25519 (默认推荐，链接极短、支持二维码)"
+    cecho "2. ML-KEM-768 (全链路后量子，字符串极长)"
+    cecho "3. X25519 + ML-KEM-768 同时启用 (优点: 双重兜底防单一算法失效；缺点: 链接最长/无二维码/握手略重)"
+    printf "请选择 [1-3] (默认 1): "
+    read -r ve_auth_choice
+    [ -z "$ve_auth_choice" ] && ve_auth_choice="1"
+
+    cecho "${GREEN}正在生成 VLESS Encryption 密钥对...${PLAIN}"
+    generate_vless_enc_keys "$ve_auth_choice" || return 1
+    ve_decryption="$VE_DECRYPTION"
+    ve_encryption="$VE_ENCRYPTION"
+    return 0
+}
+
+# === 新增功能：在现有配置上无损加装新协议 ===
+add_protocol() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cecho "${RED}未找到现有配置文件 ($CONFIG_FILE)，请先使用选项 1 进行全新安装。${PLAIN}"
+        return 1
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        install_dependencies
+    fi
+
+    local has_reality="false" has_ss="false" has_ve="false"
+    [ -n "$(jq -c '.inbounds[] | select(.protocol == "vless" and .streamSettings.security == "reality")' "$CONFIG_FILE" | head -n 1)" ] && has_reality="true"
+    [ -n "$(jq -c '.inbounds[] | select(.protocol == "shadowsocks")' "$CONFIG_FILE" | head -n 1)" ] && has_ss="true"
+    [ -n "$(jq -c '.inbounds[] | select(.protocol == "vless" and (.settings.decryption // "none") != "none")' "$CONFIG_FILE" | head -n 1)" ] && has_ve="true"
+
+    if [ "$has_reality" = "true" ] && [ "$has_ss" = "true" ] && [ "$has_ve" = "true" ]; then
+        cecho "${YELLOW}当前已同时安装 Reality、Shadowsocks 和 VLESS Encryption，无需再加装。${PLAIN}"
+        return 0
+    fi
+
+    cecho ""
+    cecho "${GREEN}--- 无损加装新协议 (不影响现有节点配置) ---${PLAIN}"
+    cecho "当前已装: Reality=${CYAN}${has_reality}${PLAIN} | SS=${CYAN}${has_ss}${PLAIN} | VLESS-Enc=${CYAN}${has_ve}${PLAIN}"
+    cecho "1. 加装 Reality"
+    cecho "2. 加装 Shadowsocks"
+    cecho "3. 加装 VLESS Encryption"
+    cecho "0. 返回主菜单"
+    printf "请选择要加装的协议 [0-3]: "
+    read -r add_choice
+    [ "$add_choice" = "0" ] && return 2
+
+    local existing_ports
+    existing_ports=$(jq -r '.inbounds[].port' "$CONFIG_FILE" | tr '\n' ' ')
+
+    local tmp_cfg next_cfg
+    tmp_cfg=$(mktemp)
+    cp "$CONFIG_FILE" "$tmp_cfg"
+    next_cfg="${tmp_cfg}.next"
+
+    case "$add_choice" in
+        1)
+            if [ "$has_reality" = "true" ]; then
+                cecho "${YELLOW}Reality 已存在，如需调整请使用「修改节点信息」。${PLAIN}"
+                rm -f "$tmp_cfg"
+                return 0
+            fi
+            collect_reality_params "$existing_ports" || { rm -f "$tmp_cfg"; return 1; }
+            jq --argjson rport "$reality_port" \
+               --argjson iport "$reality_inner_port" \
+               --arg uuid "$reality_uuid" \
+               --arg sni "$reality_sni" \
+               --arg pk "$reality_private_key" \
+               --arg sid "$reality_shortid" \
+               --arg dhost "$reality_dest_host" \
+               --argjson dport "$reality_dest_port" \
+               '.inbounds += [
+                    {
+                        "port": $rport,
+                        "protocol": "vless",
+                        "settings": {
+                            "clients": [{"id": $uuid, "flow": "xtls-rprx-vision"}],
+                            "decryption": "none"
+                        },
+                        "streamSettings": {
+                            "network": "tcp",
+                            "security": "reality",
+                            "realitySettings": {
+                                "dest": ("127.0.0.1:" + ($iport | tostring)),
+                                "serverNames": [$sni],
+                                "privateKey": $pk,
+                                "shortIds": [$sid]
+                            }
+                        },
+                        "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+                    },
+                    {
+                        "tag": "dokodemo-in",
+                        "listen": "127.0.0.1",
+                        "port": $iport,
+                        "protocol": "dokodemo-door",
+                        "settings": {"address": $dhost, "port": $dport, "network": "tcp"},
+                        "sniffing": {"enabled": true, "destOverride": ["tls"], "routeOnly": true}
+                    }
+               ]
+               | .routing.rules = [
+                    {"inboundTag": ["dokodemo-in"], "domain": [$sni], "outboundTag": "direct"},
+                    {"inboundTag": ["dokodemo-in"], "outboundTag": "block"}
+               ] + .routing.rules' \
+               "$tmp_cfg" > "$next_cfg" || { rm -f "$tmp_cfg" "$next_cfg"; return 1; }
+            mv "$next_cfg" "$tmp_cfg"
+            if apply_and_restart_config "$tmp_cfg"; then
+                show_node_info
+            fi
+            ;;
+        2)
+            if [ "$has_ss" = "true" ]; then
+                cecho "${YELLOW}Shadowsocks 已存在，如需调整请使用「修改节点信息」。${PLAIN}"
+                rm -f "$tmp_cfg"
+                return 0
+            fi
+            collect_ss_params "$existing_ports" || { rm -f "$tmp_cfg"; return 1; }
+            jq --argjson port "$ss_port" \
+               --arg method "$ss_method" \
+               --arg pass "$ss_password" \
+               '.inbounds += [
+                    {
+                        "port": $port,
+                        "protocol": "shadowsocks",
+                        "settings": {"method": $method, "password": $pass, "network": "tcp,udp"},
+                        "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+                    }
+               ]' \
+               "$tmp_cfg" > "$next_cfg" || { rm -f "$tmp_cfg" "$next_cfg"; return 1; }
+            mv "$next_cfg" "$tmp_cfg"
+            if apply_and_restart_config "$tmp_cfg"; then
+                show_node_info
+            fi
+            ;;
+        3)
+            if [ "$has_ve" = "true" ]; then
+                cecho "${YELLOW}VLESS Encryption 已存在，如需调整请使用「修改节点信息」。${PLAIN}"
+                rm -f "$tmp_cfg"
+                return 0
+            fi
+            collect_vless_enc_params "$existing_ports" || { rm -f "$tmp_cfg"; return 1; }
+            jq --argjson port "$ve_port" \
+               --arg uuid "$ve_uuid" \
+               --arg flow "$ve_flow" \
+               --arg dec "$ve_decryption" \
+               '.inbounds += [
+                    {
+                        "port": $port,
+                        "protocol": "vless",
+                        "settings": {
+                            "clients": [
+                                (if $flow != "" then {"id": $uuid, "flow": $flow} else {"id": $uuid} end)
+                            ],
+                            "decryption": $dec
+                        },
+                        "streamSettings": {"network": "raw", "security": "none"},
+                        "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true}
+                    }
+               ]' \
+               "$tmp_cfg" > "$next_cfg" || { rm -f "$tmp_cfg" "$next_cfg"; return 1; }
+            mv "$next_cfg" "$tmp_cfg"
+            if apply_and_restart_config "$tmp_cfg"; then
+                save_node_metadata "" "" "$ve_encryption"
+                show_node_info
+            fi
+            ;;
+        *)
+            cecho "${RED}无效选择。${PLAIN}"
+            rm -f "$tmp_cfg"
+            return 1
+            ;;
+    esac
 }
 
 # 配置生成主逻辑 (全新安装 / 彻底重置)
@@ -947,22 +1480,31 @@ configure_xray() {
     install_dependencies
     install_xray || return 1
 
-    cecho "${GREEN}请选择安装模式：${PLAIN}"
+    cecho "${GREEN}请选择全新安装模式 (后续也可通过菜单选项 2 随时无损加装其他协议)：${PLAIN}"
     cecho "1. 仅安装 Reality"
     cecho "2. 仅安装 Shadowsocks"
-    cecho "3. 安装 Reality + Shadowsocks (共存)"
-    printf "请输入选项 [1-3] (默认 1): "
+    cecho "3. 仅安装 VLESS Encryption"
+    cecho "4. 安装 Reality + Shadowsocks"
+    cecho "5. 安装 Reality + VLESS Encryption"
+    cecho "6. 安装 Reality + Shadowsocks + VLESS Encryption (全装)"
+    printf "请输入选项 [1-6] (默认 1): "
     read -r install_mode
     [ -z "$install_mode" ] && install_mode="1"
+
+    local want_reality="false" want_ss="false" want_ve="false"
     case "$install_mode" in
-        1|2|3) ;;
+        1) want_reality="true" ;;
+        2) want_ss="true" ;;
+        3) want_ve="true" ;;
+        4) want_reality="true"; want_ss="true" ;;
+        5) want_reality="true"; want_ve="true" ;;
+        6) want_reality="true"; want_ss="true"; want_ve="true" ;;
         *)
             cecho "${RED}无效选项，已取消配置。${PLAIN}"
             return 1
             ;;
     esac
 
-    # === 公共配置收集 ===
     cecho "${GREEN}请选择默认出站策略：${PLAIN}"
     cecho "1. 优先/指定 IPv4 (IP4_out, 默认)"
     cecho "2. 优先/指定 IPv6 (IP6_out)"
@@ -980,153 +1522,27 @@ configure_xray() {
     read -r custom_node_name
     [ -z "$custom_node_name" ] && custom_node_name="$default_host"
 
-    local reality_port=""
-    local reality_inner_port=""
+    local used_ports=""
+    ve_encryption=""
 
-    # === Reality 配置收集 ===
-    if [ "$install_mode" = "1" ] || [ "$install_mode" = "3" ]; then
-        cecho "${YELLOW}--- 配置 Reality (新版防偷流量架构) ---${PLAIN}"
-
-        # 外网端口
-        printf "请输入 Reality 外网端口 (默认随机 40000-65535): "
-        read -r reality_port
-        if [ -z "$reality_port" ]; then
-            reality_port=$(get_free_random_port 40000 65535)
-        elif ! is_valid_port "$reality_port"; then
-            cecho "${RED}错误：Reality 外网端口 (${reality_port}) 无效！${PLAIN}"
-            return 1
-        fi
-
-        # 内网回落端口 (支持手动输入，默认随机且防冲突)
-        printf "请输入 Reality 内网回落端口 (仅监听 127.0.0.1，默认随机 20000-39999): "
-        read -r reality_inner_port
-        if [ -z "$reality_inner_port" ]; then
-            reality_inner_port=$(get_free_random_port 20000 39999 "$reality_port")
-        else
-            if ! is_valid_port "$reality_inner_port"; then
-                cecho "${RED}错误：Reality 内网回落端口 (${reality_inner_port}) 无效！${PLAIN}"
-                return 1
-            fi
-            if [ "$reality_inner_port" = "$reality_port" ]; then
-                cecho "${RED}错误：内网回落端口不能与外网端口 (${reality_port}) 相同！${PLAIN}"
-                return 1
-            fi
-        fi
-
-        # 真实伪装目标
-        printf "请输入真实伪装目标 (如 www.tesla.com:443，默认 www.tesla.com:443): "
-        read -r reality_dest
-        [ -z "$reality_dest" ] && reality_dest="www.tesla.com:443"
-        case "$reality_dest" in
-            *:*)
-                reality_dest_host=$(printf '%s' "$reality_dest" | cut -d: -f1)
-                reality_dest_port=$(printf '%s' "$reality_dest" | cut -d: -f2)
-                ;;
-            *)
-                reality_dest_host="$reality_dest"
-                reality_dest_port="443"
-                ;;
-        esac
-
-        if ! is_valid_port "$reality_dest_port"; then
-            cecho "${RED}错误：伪装目标端口 (${reality_dest_port}) 必须为 1-65535 之间的数字！${PLAIN}"
-            return 1
-        fi
-
-        printf "请输入 SNI 域名 serverName (默认 %s): " "$reality_dest_host"
-        read -r reality_sni
-        [ -z "$reality_sni" ] && reality_sni="$reality_dest_host"
-
-        # UUID (支持手动输入，留空默认随机)
-        printf "请输入 UUID (留空自动随机生成): "
-        read -r reality_uuid
-        if [ -z "$reality_uuid" ]; then
-            reality_uuid=$("$XRAY_BIN" uuid)
-        elif ! is_valid_uuid "$reality_uuid"; then
-            cecho "${RED}错误：输入的 UUID 格式无效！${PLAIN}"
-            return 1
-        fi
-
-        # ShortId (支持手动输入，留空默认随机)
-        printf "请输入 ShortId (2-16位偶数十六进制字符，留空自动随机生成): "
-        read -r reality_shortid
-        if [ -z "$reality_shortid" ]; then
-            reality_shortid=$(openssl rand -hex 8)
-        elif ! is_valid_shortid "$reality_shortid"; then
-            cecho "${RED}错误：ShortId 必须为 2-16 位偶数长度的十六进制字符 (0-9, a-f)！${PLAIN}"
-            return 1
-        fi
-
-        cecho "${GREEN}正在生成 X25519 密钥...${PLAIN}"
-        x25519_out=$("$XRAY_BIN" x25519)
-        if [ -z "$x25519_out" ]; then
-            cecho "${RED}错误：无法运行 Xray 生成密钥！${PLAIN}"
-            return 1
-        fi
-
-        reality_private_key=$(printf '%s\n' "$x25519_out" | grep -i "^Private" | cut -d: -f2 | tr -d ' \r\n')
-        reality_public_key=$(printf '%s\n' "$x25519_out" | grep -Ei "^(Public|Password)" | cut -d: -f2 | tr -d ' \r\n')
-
-        if [ -z "$reality_private_key" ] || [ -z "$reality_public_key" ] || [ -z "$reality_uuid" ]; then
-            cecho "${RED}错误：获取密钥或 UUID 失败。${PLAIN}"
-            return 1
-        fi
+    if [ "$want_reality" = "true" ]; then
+        collect_reality_params "$used_ports" || return 1
+        used_ports="$used_ports $reality_port $reality_inner_port"
     fi
 
-    # === SS 配置收集 ===
-    if [ "$install_mode" = "2" ] || [ "$install_mode" = "3" ]; then
-        cecho "${YELLOW}--- 配置 Shadowsocks ---${PLAIN}"
-
-        printf "请输入 SS 端口 (默认随机 40000-65535): "
-        read -r ss_port
-        if [ -z "$ss_port" ]; then
-            ss_port=$(get_free_random_port 40000 65535 "$reality_port" "$reality_inner_port")
-        else
-            if ! is_valid_port "$ss_port"; then
-                cecho "${RED}错误：SS 端口 (${ss_port}) 无效！${PLAIN}"
-                return 1
-            fi
-            if [ "$install_mode" = "3" ] && { [ "$ss_port" = "$reality_port" ] || [ "$ss_port" = "$reality_inner_port" ]; }; then
-                cecho "${RED}错误：SS 端口不能与 Reality 外网/内网端口冲突！${PLAIN}"
-                return 1
-            fi
-        fi
-
-        cecho "请选择加密方式:"
-        cecho "--- 2022 新版协议 (性能好，但对时间敏感) ---"
-        cecho "1. 2022-blake3-aes-128-gcm"
-        cecho "2. 2022-blake3-aes-256-gcm (推荐)"
-        cecho "3. 2022-blake3-chacha20-poly1305"
-        cecho "--- 经典通用协议 (兼容性最好) ---"
-        cecho "4. aes-128-gcm"
-        cecho "5. aes-256-gcm (常用)"
-        cecho "6. chacha20-poly1305 (移动端推荐)"
-        cecho "7. xchacha20-poly1305"
-
-        printf "请选择 [1-7] (默认 2): "
-        read -r ss_method_choice
-        case "$ss_method_choice" in
-            1) ss_method="2022-blake3-aes-128-gcm" ;;
-            2) ss_method="2022-blake3-aes-256-gcm" ;;
-            3) ss_method="2022-blake3-chacha20-poly1305" ;;
-            4) ss_method="aes-128-gcm" ;;
-            5) ss_method="aes-256-gcm" ;;
-            6) ss_method="chacha20-poly1305" ;;
-            7) ss_method="xchacha20-poly1305" ;;
-            *) ss_method="2022-blake3-aes-256-gcm" ;;
-        esac
-
-        printf "请输入 SS 密码 (留空自动生成): "
-        read -r ss_password
-        if [ -z "$ss_password" ]; then
-            ss_password=$(generate_ss_password "$ss_method")
-        fi
+    if [ "$want_ss" = "true" ]; then
+        collect_ss_params "$used_ports" || return 1
+        used_ports="$used_ports $ss_port"
     fi
 
-    # === 生成临时配置文件并原子校验应用 ===
+    if [ "$want_ve" = "true" ]; then
+        collect_vless_enc_params "$used_ports" || return 1
+        used_ports="$used_ports $ve_port"
+    fi
+
     cecho "${GREEN}正在生成配置文件...${PLAIN}"
     mkdir -p "$(dirname "$CONFIG_FILE")"
-    local tmp_cfg
+    local tmp_cfg need_comma="false"
     tmp_cfg=$(mktemp)
 
     cat > "$tmp_cfg" <<EOF
@@ -1137,7 +1553,7 @@ configure_xray() {
     "inbounds": [
 EOF
 
-    if [ "$install_mode" = "1" ] || [ "$install_mode" = "3" ]; then
+    if [ "$want_reality" = "true" ]; then
         cat >> "$tmp_cfg" <<EOF
         {
             "port": $reality_port,
@@ -1188,13 +1604,11 @@ EOF
             }
         }
 EOF
+        need_comma="true"
     fi
 
-    if [ "$install_mode" = "3" ]; then
-        printf ',\n' >> "$tmp_cfg"
-    fi
-
-    if [ "$install_mode" = "2" ] || [ "$install_mode" = "3" ]; then
+    if [ "$want_ss" = "true" ]; then
+        [ "$need_comma" = "true" ] && printf ',\n' >> "$tmp_cfg"
         cat >> "$tmp_cfg" <<EOF
         {
             "port": $ss_port,
@@ -1203,6 +1617,36 @@ EOF
                 "method": "$ss_method",
                 "password": "$ss_password",
                 "network": "tcp,udp"
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"],
+                "routeOnly": true
+            }
+        }
+EOF
+        need_comma="true"
+    fi
+
+    if [ "$want_ve" = "true" ]; then
+        [ "$need_comma" = "true" ] && printf ',\n' >> "$tmp_cfg"
+        local ve_flow_line=""
+        [ -n "$ve_flow" ] && ve_flow_line=",\"flow\": \"$ve_flow\""
+        cat >> "$tmp_cfg" <<EOF
+        {
+            "port": $ve_port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "$ve_uuid"$ve_flow_line
+                    }
+                ],
+                "decryption": "$ve_decryption"
+            },
+            "streamSettings": {
+                "network": "raw",
+                "security": "none"
             },
             "sniffing": {
                 "enabled": true,
@@ -1243,11 +1687,11 @@ EOF
         "rules": [
 EOF
 
-    if [ "$install_mode" = "1" ] || [ "$install_mode" = "3" ]; then
+    if [ "$want_reality" = "true" ]; then
         cat >> "$tmp_cfg" <<EOF
             {
                 "inboundTag": [
-                        "dokodemo-in"
+                    "dokodemo-in"
                 ],
                 "domain": [
                     "$reality_sni"
@@ -1256,8 +1700,8 @@ EOF
             },
             {
                 "inboundTag": [
-                        "dokodemo-in"
-                        ],
+                    "dokodemo-in"
+                ],
                 "outboundTag": "block"
             },
 EOF
@@ -1295,7 +1739,7 @@ EOF
 
     if apply_and_restart_config "$tmp_cfg"; then
         detected_ip=$(get_ip)
-        save_node_metadata "$custom_node_name" "$detected_ip"
+        save_node_metadata "$custom_node_name" "$detected_ip" "$ve_encryption"
         show_node_info
     fi
 }
@@ -1308,15 +1752,16 @@ main_menu() {
         cecho ""
         cecho "${GREEN}========== Xray 一键安装/管理脚本 (全系统通用 POSIX 版) ==========${PLAIN}"
         cecho "当前环境: 包管理器=${CYAN}${PKG_MGR}${PLAIN} | 服务管理=${CYAN}${INIT_SYS}${PLAIN}"
-        cecho "1. 安装/重置 Xray 配置 (Reality / SS)"
-        cecho "2. 查看当前已配置的节点信息、分享链接与二维码"
-        cecho "3. 修改已配置的节点信息 (Reality / SS / 出口策略)"
-        cecho "4. 单独更新 Xray 内核"
-        cecho "5. 卸载 Xray"
+        cecho "1. 全新安装/重置 Xray 配置 (Reality / SS / VLESS Encryption)"
+        cecho "2. 无损加装新协议 (不影响已安装的现有协议)"
+        cecho "3. 查看当前已配置的节点信息、分享链接与二维码"
+        cecho "4. 修改已配置的节点信息 (Reality / SS / VLESS-Enc / 出口策略)"
+        cecho "5. 单独更新 Xray 内核"
+        cecho "6. 卸载 Xray"
         cecho "0. 退出"
         cecho "=================================================================="
 
-        printf "请选择 [0-5]: "
+        printf "请选择 [0-6]: "
         read -r choice
 
         case "$choice" in
@@ -1325,20 +1770,24 @@ main_menu() {
                 pause_and_return
                 ;;
             2)
+                add_protocol
+                [ "$?" -ne 2 ] && pause_and_return
+                ;;
+            3)
                 show_node_info
                 pause_and_return
                 ;;
-            3)
-                modify_node_info
-                pause_and_return
-                ;;
             4)
+                modify_node_info
+                [ "$?" -ne 2 ] && pause_and_return
+                ;;
+            5)
                 if install_xray && service_enable_and_restart; then
                     cecho "${GREEN}Xray 更新完成${PLAIN}"
                 fi
                 pause_and_return
                 ;;
-            5)
+            6)
                 uninstall_xray
                 pause_and_return
                 ;;
@@ -1347,7 +1796,7 @@ main_menu() {
                 exit 0
                 ;;
             *)
-                cecho "${RED}无效选择，请输入 0-5 之间的数字。${PLAIN}"
+                cecho "${RED}无效选择，请输入 0-6 之间的数字。${PLAIN}"
                 ;;
         esac
     done
