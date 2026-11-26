@@ -51,8 +51,7 @@ secure_config_permissions() {
 
 # 生成未占用的随机内网端口 (仅当旧配置无 dokodemo-in 时使用)
 get_free_inner_port() {
-    local ex1="${1:-}"
-    local ex2="${2:-}"
+    local exclude_list="${1:-}"
     local p=""
     local i=0
     while [ "$i" -lt 30 ]; do
@@ -61,15 +60,18 @@ get_free_inner_port() {
         else
             p=$(awk -v s="$((i + $$))" 'BEGIN{srand(s); print int(20000+rand()*20000)}')
         fi
-        if [ "$p" != "$ex1" ] && [ "$p" != "$ex2" ]; then
-            if command -v ss >/dev/null 2>&1 && ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${p}$"; then
+        case " $exclude_list " in
+            *" $p "*)
                 i=$((i + 1))
                 continue
-            fi
-            printf '%s' "$p"
-            return 0
+                ;;
+        esac
+        if command -v ss >/dev/null 2>&1 && ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${p}$"; then
+            i=$((i + 1))
+            continue
         fi
-        i=$((i + 1))
+        printf '%s' "$p"
+        return 0
     done
     printf '%s' "$p"
 }
@@ -137,17 +139,20 @@ fi
 reality_json=$(jq -c '.inbounds[] | select(.protocol == "vless" and .streamSettings.security == "reality")' "$clean_cfg" | head -n 1)
 dokodemo_json=$(jq -c '.inbounds[] | select(.protocol == "dokodemo-door")' "$clean_cfg" | head -n 1)
 ss_json=$(jq -c '.inbounds[] | select(.protocol == "shadowsocks")' "$clean_cfg" | head -n 1)
+ve_json=$(jq -c '.inbounds[] | select(.protocol == "vless" and (.settings.decryption // "none") != "none")' "$clean_cfg" | head -n 1)
 rm -f "$clean_cfg"
 
-if [ -z "$reality_json" ] && [ -z "$ss_json" ]; then
-    cecho "${RED}错误：未在旧配置中检测到 Reality 或 Shadowsocks 入站。${PLAIN}"
+if [ -z "$reality_json" ] && [ -z "$ss_json" ] && [ -z "$ve_json" ]; then
+    cecho "${RED}错误：未在旧配置中检测到 Reality、Shadowsocks 或 VLESS Encryption 入站。${PLAIN}"
     exit 1
 fi
 
 has_reality="false"
 has_ss="false"
+has_ve="false"
 [ -n "$reality_json" ] && has_reality="true"
 [ -n "$ss_json" ] && has_ss="true"
+[ -n "$ve_json" ] && has_ve="true"
 
 # 提取 SS 参数
 ss_port=""
@@ -156,6 +161,17 @@ if [ "$has_ss" = "true" ]; then
     ss_method=$(printf '%s' "$ss_json" | jq -r '.settings.method')
     ss_password=$(printf '%s' "$ss_json" | jq -r '.settings.password')
     ss_network=$(printf '%s' "$ss_json" | jq -r '.settings.network // "tcp,udp"')
+fi
+
+# 提取 VLESS Encryption 参数
+ve_port=""
+if [ "$has_ve" = "true" ]; then
+    ve_port=$(printf '%s' "$ve_json" | jq -r '.port')
+    ve_uuid=$(printf '%s' "$ve_json" | jq -r '.settings.clients[0].id')
+    ve_flow=$(printf '%s' "$ve_json" | jq -r '.settings.clients[0].flow // ""')
+    ve_decryption=$(printf '%s' "$ve_json" | jq -r '.settings.decryption')
+    ve_network=$(printf '%s' "$ve_json" | jq -r '.streamSettings.network // "raw"')
+    ve_security=$(printf '%s' "$ve_json" | jq -r '.streamSettings.security // "none"')
 fi
 
 # 提取 Reality 参数 (兼容旧版 dokodemo 在前、新版 vless 在前、以及无 dokodemo 三种情况)
@@ -199,7 +215,7 @@ if [ "$has_reality" = "true" ]; then
     else
         cecho "${CYAN}检测到纯 Reality 架构，将无损升级为新版防偷流量架构...${PLAIN}"
         reality_port=$(printf '%s' "$reality_json" | jq -r '.port')
-        reality_inner_port=$(get_free_inner_port "$reality_port" "$ss_port")
+        reality_inner_port=$(get_free_inner_port "$reality_port $ss_port $ve_port")
         raw_dest=$(printf '%s' "$reality_json" | jq -r '.streamSettings.realitySettings.dest // .streamSettings.realitySettings.target')
         case "$raw_dest" in
             *:*)
@@ -233,6 +249,10 @@ fi
 if [ "$has_ss" = "true" ]; then
     cecho "  [SS]      端口=${ss_port} | 加密=${ss_method} | 密码=${ss_password}"
 fi
+if [ "$has_ve" = "true" ]; then
+    cecho "  [VLESS-E] 端口=${ve_port} | UUID=${ve_uuid} | 流控=${ve_flow:-无} | 传输=${ve_network}"
+    cecho "            Decryption=${ve_decryption}"
+fi
 
 cecho "\n${GREEN}请选择迁移后的默认出站策略：${PLAIN}"
 cecho "1. IPv4 出口 (IP4_out, 默认)"
@@ -250,6 +270,7 @@ esac
 raw_tmp=$(mktemp)
 tmp_cfg="${raw_tmp}.json"
 mv "$raw_tmp" "$tmp_cfg"
+need_comma="false"
 
 cat > "$tmp_cfg" <<EOF
 {
@@ -310,13 +331,11 @@ if [ "$has_reality" = "true" ]; then
             }
         }
 EOF
-fi
-
-if [ "$has_reality" = "true" ] && [ "$has_ss" = "true" ]; then
-    printf ',\n' >> "$tmp_cfg"
+    need_comma="true"
 fi
 
 if [ "$has_ss" = "true" ]; then
+    [ "$need_comma" = "true" ] && printf ',\n' >> "$tmp_cfg"
     cat >> "$tmp_cfg" <<EOF
         {
             "port": $ss_port,
@@ -325,6 +344,36 @@ if [ "$has_ss" = "true" ]; then
                 "method": "$ss_method",
                 "password": "$ss_password",
                 "network": "$ss_network"
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"],
+                "routeOnly": true
+            }
+        }
+EOF
+    need_comma="true"
+fi
+
+if [ "$has_ve" = "true" ]; then
+    [ "$need_comma" = "true" ] && printf ',\n' >> "$tmp_cfg"
+    ve_flow_line=""
+    [ -n "$ve_flow" ] && ve_flow_line=",\"flow\": \"$ve_flow\""
+    cat >> "$tmp_cfg" <<EOF
+        {
+            "port": $ve_port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id": "$ve_uuid"$ve_flow_line
+                    }
+                ],
+                "decryption": "$ve_decryption"
+            },
+            "streamSettings": {
+                "network": "$ve_network",
+                "security": "$ve_security"
             },
             "sniffing": {
                 "enabled": true,
@@ -369,7 +418,7 @@ if [ "$has_reality" = "true" ]; then
     cat >> "$tmp_cfg" <<EOF
             {
                 "inboundTag": [
-                        "dokodemo-in"
+                    "dokodemo-in"
                 ],
                 "domain": [
                     "$reality_sni"
@@ -378,7 +427,7 @@ if [ "$has_reality" = "true" ]; then
             },
             {
                 "inboundTag": [
-                        "dokodemo-in"
+                    "dokodemo-in"
                 ],
                 "outboundTag": "block"
             },
